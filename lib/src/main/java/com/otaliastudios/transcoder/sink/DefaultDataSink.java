@@ -37,13 +37,17 @@ public class DefaultDataSink implements DataSink {
      */
     private static class QueuedSample {
         private final TrackType mType;
+        private ByteBuffer mByteBuffer;
+
         private final int mSize;
         private final long mTimeUs;
         private final int mFlags;
 
         private QueuedSample(@NonNull TrackType type,
+                             @NonNull ByteBuffer byteBuffer,
                              @NonNull MediaCodec.BufferInfo bufferInfo) {
             mType = type;
+            mByteBuffer = byteBuffer;
             mSize = bufferInfo.size;
             mTimeUs = bufferInfo.presentationTimeUs;
             mFlags = bufferInfo.flags;
@@ -52,14 +56,9 @@ public class DefaultDataSink implements DataSink {
 
     private final static Logger LOG = new Logger("DefaultDataSink");
 
-    // We must be able to handle potentially big buffers (e.g. first keyframe) in the queue.
-    // Got crashes with 152kb - let's use 256kb. TODO use a dynamic queue instead
-    private final static int BUFFER_SIZE = 256 * 1024;
-
     private boolean mMuxerStarted = false;
     private final MediaMuxer mMuxer;
     private final List<QueuedSample> mQueue = new ArrayList<>();
-    private ByteBuffer mQueueBuffer;
     private final MutableTrackMap<TrackStatus> mStatus = mutableTrackMapOf(null);
     private final MutableTrackMap<MediaFormat> mLastFormat = mutableTrackMapOf(null);
     private final MutableTrackMap<Integer> mMuxerIndex = mutableTrackMapOf(null);
@@ -129,16 +128,16 @@ public class DefaultDataSink implements DataSink {
         MediaFormat audioOutputFormat = mLastFormat.getOrNull(TrackType.AUDIO);
         boolean isVideoReady = videoOutputFormat != null || !isTranscodingVideo;
         boolean isAudioReady = audioOutputFormat != null || !isTranscodingAudio;
-        if (!isVideoReady || !isAudioReady) return;
+        if (!isVideoReady && !isAudioReady) return;
 
-        // If both video and audio are ready, we can go on.
+        // If each video and audio are ready, we can go on.
         // We will stop buffering data and we will start actually muxing it.
-        if (isTranscodingVideo) {
+        if (isVideoReady) {
             int videoIndex = mMuxer.addTrack(videoOutputFormat);
             mMuxerIndex.setVideo(videoIndex);
             LOG.v("Added track #" + videoIndex + " with " + videoOutputFormat.getString(MediaFormat.KEY_MIME) + " to muxer");
         }
-        if (isTranscodingAudio) {
+        if (isAudioReady) {
             int audioIndex = mMuxer.addTrack(audioOutputFormat);
             mMuxerIndex.setAudio(audioIndex);
             LOG.v("Added track #" + audioIndex + " with " + audioOutputFormat.getString(MediaFormat.KEY_MIME) + " to muxer");
@@ -150,7 +149,8 @@ public class DefaultDataSink implements DataSink {
 
     @Override
     public void writeTrack(@NonNull TrackType type, @NonNull ByteBuffer byteBuffer, @NonNull MediaCodec.BufferInfo bufferInfo) {
-        if (mMuxerStarted) {
+        Integer muxerIndex = mMuxerIndex.getOrNull(type);
+        if (mMuxerStarted && muxerIndex != null) {
             /* LOG.v("writeTrack(" + type + "): offset=" + bufferInfo.offset
                     + "\trealOffset=" + byteBuffer.position()
                     + "\tsize=" + bufferInfo.size
@@ -160,7 +160,7 @@ public class DefaultDataSink implements DataSink {
                     + "\teos=" + ((bufferInfo.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) == MediaCodec.BUFFER_FLAG_END_OF_STREAM)
             );
              */
-            mMuxer.writeSampleData(mMuxerIndex.get(type), byteBuffer, bufferInfo);
+            mMuxer.writeSampleData(muxerIndex, byteBuffer, bufferInfo);
         } else {
             enqueue(type, byteBuffer, bufferInfo);
         }
@@ -177,19 +177,14 @@ public class DefaultDataSink implements DataSink {
     private void enqueue(@NonNull TrackType type,
                          @NonNull ByteBuffer buffer,
                          @NonNull MediaCodec.BufferInfo bufferInfo) {
-        if (mQueueBuffer == null) {
-            mQueueBuffer = ByteBuffer.allocateDirect(BUFFER_SIZE).order(ByteOrder.nativeOrder());
-        }
         LOG.v("enqueue(" + type + "): offset=" + bufferInfo.offset
                 + "\trealOffset=" + buffer.position()
                 + "\tsize=" + bufferInfo.size
-                + "\trealSize=" + buffer.remaining()
-                + "\tavailable=" + mQueueBuffer.remaining()
-                + "\ttotal=" + BUFFER_SIZE);
-        buffer.limit(bufferInfo.offset + bufferInfo.size);
-        buffer.position(bufferInfo.offset);
-        mQueueBuffer.put(buffer);
-        mQueue.add(new QueuedSample(type, bufferInfo));
+                + "\trealSize=" + buffer.remaining());
+
+        ByteBuffer byteBuffer = ByteBuffer.allocateDirect(bufferInfo.size).order(ByteOrder.nativeOrder());
+        byteBuffer.put(buffer);
+        mQueue.add(new QueuedSample(type, byteBuffer, bufferInfo));
     }
 
     /**
@@ -198,19 +193,16 @@ public class DefaultDataSink implements DataSink {
      */
     private void drainQueue() {
         if (mQueue.isEmpty()) return;
-        mQueueBuffer.flip();
         LOG.i("Output format determined, writing pending data into the muxer. "
-                + "samples:" + mQueue.size() + " "
-                + "bytes:" + mQueueBuffer.limit());
+                + "samples:" + mQueue.size());
         MediaCodec.BufferInfo bufferInfo = new MediaCodec.BufferInfo();
-        int offset = 0;
         for (QueuedSample sample : mQueue) {
-            bufferInfo.set(offset, sample.mSize, sample.mTimeUs, sample.mFlags);
-            writeTrack(sample.mType, mQueueBuffer, bufferInfo);
-            offset += sample.mSize;
+            bufferInfo.set(0, sample.mSize, sample.mTimeUs, sample.mFlags);
+            sample.mByteBuffer.position(0);
+            writeTrack(sample.mType, sample.mByteBuffer, bufferInfo);
+            sample.mByteBuffer = null;
         }
         mQueue.clear();
-        mQueueBuffer = null;
     }
 
     @Override
